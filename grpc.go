@@ -2,7 +2,9 @@ package srvgrpc
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -82,7 +84,12 @@ func (service *GRPCService) StartWithContext(ctx context.Context) error {
 		service.serverCh = make(chan bool)
 		// Starts the GRPC server on the listener.
 		// errCh will receive any error, since this is starting on a goroutine.
-		errCh <- grpcServer.Serve(lis)
+		err := grpcServer.Serve(lis)
+		fmt.Println(err)
+		if err != http.ErrServerClosed && err != nil {
+			errCh <- err
+		}
+		close(service.serverCh)
 	}()
 
 	go func() {
@@ -92,8 +99,6 @@ func (service *GRPCService) StartWithContext(ctx context.Context) error {
 		case <-service.ctx.Done():
 		}
 		grpcServer.GracefulStop()
-		grpcServer.Stop()
-		close(service.serverCh)
 	}()
 
 	// Waits a second for the grpcServer to start.

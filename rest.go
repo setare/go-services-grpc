@@ -111,8 +111,11 @@ func (service *RESTService) StartWithContext(ctx context.Context) error {
 		service.serverCh = make(chan bool)
 		// Starts the GRPC server on the listener.
 		// errCh will receive any error, since this is starting on a goroutine.
-		errCh <- httpServer.ListenAndServe()
-		defer close(service.serverCh)
+		err := httpServer.ListenAndServe()
+		if err != http.ErrServerClosed && err != nil {
+			errCh <- err
+		}
+		close(service.serverCh)
 	}()
 
 	go func() {
