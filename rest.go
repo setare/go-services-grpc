@@ -102,6 +102,7 @@ func (service *RESTService) StartWithContext(ctx context.Context) error {
 	}
 
 	httpServer := http.Server{
+		Addr:    service.bindAddr,
 		Handler: mux,
 	}
 
