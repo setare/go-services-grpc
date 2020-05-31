@@ -3,6 +3,8 @@ package srvgrpc
 import (
 	"context"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"google.golang.org/grpc"
@@ -11,6 +13,10 @@ import (
 type RESTSetupFunc func(context.Context, *runtime.ServeMux, ...grpc.DialOption) error
 
 type RESTService struct {
+	serverCh      chan bool
+	ctxLock       sync.Mutex
+	ctx           context.Context
+	cancelFunc    context.CancelFunc
 	bindAddr      string
 	name          string
 	withUserAgent string
@@ -53,7 +59,17 @@ func (service *RESTService) Name() string {
 //
 // If the service is successfully stopped, `nil` should be returned. Otherwise, an error must be returned.
 func (service *RESTService) Stop() error {
-	panic("not implemented") // TODO: Implement
+	service.ctxLock.Lock()
+	defer func() {
+		service.ctx = nil
+		service.cancelFunc = nil
+		service.ctxLock.Unlock()
+	}()
+	if service.cancelFunc != nil {
+		service.cancelFunc()
+	}
+	<-service.serverCh // Waits for the shutdown
+	return nil
 }
 
 // StartWithContext start the service in a blocking way. This is cancellable, so the context received can be
@@ -62,6 +78,10 @@ func (service *RESTService) Stop() error {
 //
 // If the service is successfully started, `nil` should be returned. Otherwise, an error must be returned.
 func (service *RESTService) StartWithContext(ctx context.Context) error {
+	service.ctxLock.Lock()
+	service.ctx, service.cancelFunc = context.WithCancel(ctx)
+	service.ctxLock.Unlock()
+
 	mux := runtime.NewServeMux()
 	var opts []grpc.DialOption
 	if len(service.dialOpts) > 0 {
@@ -81,7 +101,39 @@ func (service *RESTService) StartWithContext(ctx context.Context) error {
 		return err
 	}
 
-	// Start HTTP server (and proxy calls to gRPC server endpoint)
-	return http.ListenAndServe(service.bindAddr, mux)
+	httpServer := http.Server{
+		Handler: mux,
+	}
 
+	errCh := make(chan error)
+	go func() {
+		service.serverCh = make(chan bool)
+		// Starts the GRPC server on the listener.
+		// errCh will receive any error, since this is starting on a goroutine.
+		errCh <- httpServer.ListenAndServe()
+		defer close(service.serverCh)
+	}()
+
+	go func() {
+		select {
+		case <-ctx.Done(): // Wait for the context to be done.
+		case <-service.ctx.Done():
+		}
+
+		// Tries to shutdown for 20 seconds
+		shutdownCtx, cancelFnc := context.WithTimeout(context.Background(), time.Second*20)
+		defer cancelFnc()
+
+		// Tries to gracefully shutdown the httpServer.
+		httpServer.Shutdown(shutdownCtx)
+	}()
+
+	// Waits a second for the grpcServer to start.
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(time.Second):
+		// After one second and it didn't failed, it should be fine.
+		return nil
+	}
 }

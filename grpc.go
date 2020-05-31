@@ -2,8 +2,8 @@ package srvgrpc
 
 import (
 	"context"
-	"log"
 	"net"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -12,6 +12,10 @@ import (
 type GRPCSetupFunc func(*grpc.Server)
 
 type GRPCService struct {
+	serverCh      chan bool
+	ctxLock       sync.Mutex
+	ctx           context.Context
+	cancelFunc    context.CancelFunc
 	bindAddr      string
 	name          string
 	serverOptions []grpc.ServerOption
@@ -42,7 +46,17 @@ func (service *GRPCService) Name() string {
 //
 // If the service is successfully stopped, `nil` should be returned. Otherwise, an error must be returned.
 func (service *GRPCService) Stop() error {
-	panic("not implemented") // TODO: Implement
+	service.ctxLock.Lock()
+	defer func() {
+		service.ctx = nil
+		service.cancelFunc = nil
+		service.ctxLock.Unlock()
+	}()
+	if service.cancelFunc != nil {
+		service.cancelFunc()
+	}
+	<-service.serverCh // Waits for the shutdown
+	return nil
 }
 
 // StartWithContext start the service in a blocking way. This is cancellable, so the context received can be
@@ -51,9 +65,13 @@ func (service *GRPCService) Stop() error {
 //
 // If the service is successfully started, `nil` should be returned. Otherwise, an error must be returned.
 func (service *GRPCService) StartWithContext(ctx context.Context) error {
+	service.ctxLock.Lock()
+	service.ctx, service.cancelFunc = context.WithCancel(ctx)
+	service.ctxLock.Unlock()
+
 	lis, err := net.Listen("tcp", service.bindAddr)
 	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+		return err
 	}
 
 	grpcServer := grpc.NewServer(service.serverOptions...)
@@ -61,16 +79,24 @@ func (service *GRPCService) StartWithContext(ctx context.Context) error {
 
 	errCh := make(chan error)
 	go func() {
+		service.serverCh = make(chan bool)
+		// Starts the GRPC server on the listener.
+		// errCh will receive any error, since this is starting on a goroutine.
 		errCh <- grpcServer.Serve(lis)
 	}()
 
 	go func() {
+		// Wait for the context to be done.
 		select {
 		case <-ctx.Done():
-			grpcServer.GracefulStop()
+		case <-service.ctx.Done():
 		}
+		grpcServer.GracefulStop()
+		grpcServer.Stop()
+		close(service.serverCh)
 	}()
 
+	// Waits a second for the grpcServer to start.
 	select {
 	case err := <-errCh:
 		return err
