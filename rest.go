@@ -12,6 +12,8 @@ import (
 
 type RESTSetupFunc func(context.Context, *runtime.ServeMux, ...grpc.DialOption) error
 
+type Interceptor func(rw http.ResponseWriter, r *http.Request, next func())
+
 type RESTService struct {
 	serverCh      chan bool
 	ctxLock       sync.Mutex
@@ -23,6 +25,7 @@ type RESTService struct {
 	withInsecure  bool
 	dialOpts      []grpc.DialOption
 	setupFunc     RESTSetupFunc
+	interceptor   Interceptor
 }
 
 func NewRESTService(bindAddr, name string, setupFunc RESTSetupFunc) *RESTService {
@@ -40,6 +43,11 @@ func (service *RESTService) WithInsecure(value bool) *RESTService {
 
 func (service *RESTService) WithUserAgent(value string) *RESTService {
 	service.withUserAgent = value
+	return service
+}
+
+func (service *RESTService) WithInterceptor(interceptor Interceptor) *RESTService {
+	service.interceptor = interceptor
 	return service
 }
 
@@ -101,9 +109,21 @@ func (service *RESTService) StartWithContext(ctx context.Context) error {
 		return err
 	}
 
+	var handler http.Handler
+
+	if service.interceptor != nil {
+		handler = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			service.interceptor(rw, r, func() {
+				mux.ServeHTTP(rw, r)
+			})
+		})
+	} else {
+		handler = mux
+	}
+
 	httpServer := http.Server{
 		Addr:    service.bindAddr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	errCh := make(chan error)
