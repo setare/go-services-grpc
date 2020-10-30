@@ -2,7 +2,6 @@ package srvgrpc
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -11,27 +10,46 @@ import (
 	"google.golang.org/grpc"
 )
 
+// GRPCConfiguration abstracts the implementation for the GRPCService configuration.
+type GRPCConfiguration interface {
+	// BindAddr returns the bind address for the GRPC server when `GRPCService` is starting. It will be called only
+	// when the `Start` of the `GRPCService` is called.
+	BindAddr() (string, error)
+}
+
+// GRPCSetupFunc receives the `grpc.Server` instance and should register it on target package.
 type GRPCSetupFunc func(*grpc.Server)
 
+// GRPCService is the `services.Service` implementation for GRPC services.
 type GRPCService struct {
+	name   string
+	config GRPCConfiguration
+
 	serverCh      chan bool
 	ctxLock       sync.Mutex
 	ctx           context.Context
 	cancelFunc    context.CancelFunc
-	bindAddr      string
-	name          string
 	serverOptions []grpc.ServerOption
 	setupFunc     GRPCSetupFunc
 }
 
-func NewGRPCService(bindAddr, name string, setupFunc GRPCSetupFunc) *GRPCService {
+// NewGRPCService returns a new instance of the `GRPCService`.
+//
+// Arguments:
+// - `name` identifies the service, required by the `github.com/setare/services.Service` interface.
+// - `config` will provide additional configuration for the grpc.Server initialization. It is a `GRPCConfiguration`
+//   interface implementation.
+// - `setupFunc` is the callback responsible for registering the implementation to the `*grpc.Server` that is passed as
+//   argument.
+func NewGRPCService(name string, config GRPCConfiguration, setupFunc GRPCSetupFunc) *GRPCService {
 	return &GRPCService{
-		bindAddr:  bindAddr,
 		name:      name,
+		config:    config,
 		setupFunc: setupFunc,
 	}
 }
 
+// ServerOptions set the `grpc.ServerOption` array that is passed when the service starts the `*grpc.Server`.
 func (service *GRPCService) ServerOptions(options ...grpc.ServerOption) *GRPCService {
 	service.serverOptions = options
 	return service
@@ -71,7 +89,12 @@ func (service *GRPCService) StartWithContext(ctx context.Context) error {
 	service.ctx, service.cancelFunc = context.WithCancel(ctx)
 	service.ctxLock.Unlock()
 
-	lis, err := net.Listen("tcp", service.bindAddr)
+	bindAddr, err := service.config.BindAddr()
+	if err != nil {
+		return err
+	}
+
+	lis, err := net.Listen("tcp", bindAddr)
 	if err != nil {
 		return err
 	}
@@ -79,16 +102,18 @@ func (service *GRPCService) StartWithContext(ctx context.Context) error {
 	grpcServer := grpc.NewServer(service.serverOptions...)
 	service.setupFunc(grpcServer)
 
+	// Channel that will receive th error if the `grpServer.Serve` fails. This approach
 	errCh := make(chan error)
 	go func() {
 		service.serverCh = make(chan bool)
 		// Starts the GRPC server on the listener.
 		// errCh will receive any error, since this is starting on a goroutine.
 		err := grpcServer.Serve(lis)
-		fmt.Println(err)
 		if err != http.ErrServerClosed && err != nil {
 			errCh <- err
 		}
+		// The `Stop` method blacks using this channel for making sure the shutdown process has been finished before
+		// unblocking.
 		close(service.serverCh)
 	}()
 
@@ -105,8 +130,8 @@ func (service *GRPCService) StartWithContext(ctx context.Context) error {
 	select {
 	case err := <-errCh:
 		return err
-	case <-time.After(time.Second):
-		// After one second and it didn't failed, it should be fine.
+	case <-time.After(time.Millisecond * 100):
+		// After 100 milliseconds and it didn't failed, it should be fine.
 		return nil
 	}
 }
